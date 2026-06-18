@@ -559,7 +559,7 @@ function draw() {
         let diffConfig = DIFFICULTY_SETTINGS[selectedDifficultyIndex];
         ctx.font = "bold 20px sans-serif";
         ctx.fillStyle = "#ffffff";
-        ctx.fillText("DIFFICULTY (▲▼): ", canvas.width / 2 - 40, GAME_HEIGHT / 2);
+        ctx.fillText("DIFFICULTY (↑↓): ", canvas.width / 2 - 40, GAME_HEIGHT / 2);
         ctx.fillStyle = diffConfig.color;
         ctx.textAlign = "left";
         ctx.fillText(diffConfig.name, canvas.width / 2 + 60, GAME_HEIGHT / 2);
@@ -714,7 +714,7 @@ function draw() {
                 let selectDiffConfig = DIFFICULTY_SETTINGS[selectedDifficultyIndex];
                 ctx.font = "bold 18px sans-serif";
                 ctx.fillStyle = "#ffffff";
-                ctx.fillText("DIFFICULTY (▲▼): ", canvas.width / 2 - 40, GAME_HEIGHT / 2 + 45);
+                ctx.fillText("DIFFICULTY (↑↓): ", canvas.width / 2 - 40, GAME_HEIGHT / 2 + 45);
                 ctx.fillStyle = selectDiffConfig.color;
                 ctx.textAlign = "left";
                 ctx.fillText(selectDiffConfig.name, canvas.width / 2 + 60, GAME_HEIGHT / 2 + 45);
