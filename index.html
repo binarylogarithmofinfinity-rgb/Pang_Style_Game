@@ -1,0 +1,762 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <title>Pang Style Game</title>
+    <style>
+        body {
+            margin: 0;
+            background-color: #222;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+            color: white;
+            font-family: 'Helvetica Neue', Arial, sans-serif;
+        }
+        canvas {
+            background-color: #000;
+            border: 4px solid #fff;
+            box-shadow: 0 0 20px rgba(0,0,0,0.8);
+        }
+    </style>
+</head>
+<body>
+
+<canvas id="gameCanvas" width="800" height="525"></canvas>
+
+<script>
+const canvas = document.getElementById("gameCanvas");
+const ctx = canvas.getContext("2d");
+
+// ゲームエリアと下部UIエリアの定義
+const GAME_HEIGHT = 500;
+const UI_HEIGHT = 500; // UIエリアの開始Y座標
+
+// ゲーム設定
+const GRAVITY = 0.15;
+const BOUNCE_COEFF = -0.99; // 跳ね返り時の減衰係数
+const ABSOLUTE_MAX_WIRES = 99; // ワイアー射出数の上限
+const MAX_PARTICLES = 1024; // パーティクルの最大保持数
+const MAX_LIFE = 3; // 最大ライフ
+
+// 難易度定義
+const DIFFICULTY_SETTINGS = [
+    { name: "EASY", increment: 1.25, color: "#00ff00" },
+    { name: "NORMAL", increment: 1.5, color: "#3399ff" },
+    { name: "HARD", increment: 2, color: "#ff3333" }
+];
+let currentDifficultyIndex = 1;  // 現在プレイ中の難易度（デフォルトは NORMAL）
+let selectedDifficultyIndex = 1; // メニュー画面で選択中の難易度
+let ballSpawnCostIncrement = 1.5; // 現在の難易度でのコストプール増加量
+
+// 60fps固定処理のための変数
+const TIMESTEP = 1000 / 60; // 1フレームあたりの時間（ミリ秒）: 約16.67ms
+let lastTime = 0;
+let accumulator = 0;
+
+// 内部処理的経過時間の管理用（ミリ秒単位）
+let gameTimeElapsed = 0;
+
+// ボールサイズ定義 (インデックス 1 が最小、7 が最大)
+const BALL_SIZES = {
+    1: { radius: 8,  color: "#ffff00" }, // 最小
+    2: { radius: 12, color: "#ffa500" },
+    3: { radius: 16, color: "#ff0000" },
+    4: { radius: 22, color: "#00ffff" },
+    5: { radius: 30, color: "#00ff00" },
+    6: { radius: 42, color: "#ff00ff" },
+    7: { radius: 58, color: "#ffffff" }  // 最大
+};
+
+// ゲームの状態管理 ("TITLE", "PLAYING", "PAUSED", "GAMEOVER")
+let gameState = "TITLE";
+
+// スコア・アニメーション管理
+let score = 0;
+let displayScore = 0;
+let isCountingUp = false;
+let gameOverStartTime = 0;
+
+// 各桁のローリングスコア管理用（可変長配列として扱う。初期状態は1桁の[0]）
+let rollingDigits = [0];
+
+// ゲージの滑らかなアニメーション用変数
+let displayProgressRatio = 0.0;
+
+// プレイヤーオブジェクト
+const player = {
+    x: canvas.width / 2,
+    y: GAME_HEIGHT - 40,
+    width: 12,
+    height: 40,
+    speed: 5,
+    dx: 0,
+    life: MAX_LIFE,
+    invincibleTimer: 0 // 無敵時間のカウンタ（フレーム数）
+};
+
+// ワイアー状態と制限
+let wires = [];
+let maxWiresAllowable = 2; // 現在許可されている最大射出数
+let destroyedSmallBallCount = 0; // ワイアー増加用の最小サイズ撃破カウント
+
+// 消滅したワイアーのエフェクトリスト
+let deadWires = [];
+
+// ボール出現コスト管理
+let ballSpawnCostPool = 0.0; // 蓄積されたコスト
+
+// 自動射出のインターバル
+let autoFireCooldown = 0;
+const FIRE_COOLDOWN_LIMIT = 0; 
+
+// ボールリスト
+let balls = [];
+
+// エフェクト（ドット粒子）リスト
+let particles = [];
+
+// キー入力状態
+let keys = {};
+
+// ボールの生成
+function spawnBall(x, y, sizeIndex, directionX, speedY = null) {
+    const config = BALL_SIZES[sizeIndex];
+    if (!config) return;
+
+    balls.push({
+        x: x,
+        y: y,
+        radius: config.radius, 
+        dx: directionX * (1.2 + (5 / (8-sizeIndex))), // サイズに応じた速度調整
+        dy: speedY !== null ? speedY : -3, 
+        sizeIndex: sizeIndex 
+    });
+}
+
+// 分裂時の物理演算を行う生成関数
+function spawnSplitBalls(parentBall) {
+    if (parentBall.sizeIndex <= 1) return; 
+
+    let newSizeIndex = parentBall.sizeIndex - 1;
+    let newDy = parentBall.dy < 0 ? parentBall.dy : -parentBall.dy;
+    if (Math.abs(newDy) < 2) newDy = -3; // 最低限の跳ね上がりを保証
+
+    spawnBall(parentBall.x, parentBall.y, newSizeIndex, 1, newDy);
+    spawnBall(parentBall.x, parentBall.y, newSizeIndex, -1, newDy);
+}
+
+// ドットエフェクト（パーティクル）の生成関数
+function createExplosion(x, y, count, color, speedY = null) {
+	const sY = (speedY !== null ? speedY : 0);
+	// パーティクルの総数が1024を超えた場合、古いもの（先頭）から削除
+	const removeCount = particles.length + count - MAX_PARTICLES;
+    if(removeCount > 0){
+		particles.splice(0, removeCount);
+	}
+	
+    for (let i = 0; i < count; i++) {
+        // 全方向にランダムな速度で散るように設定
+        const angle = (Math.random() * 2)* Math.PI;
+        const speed = Math.random() * 4; // 散らばる速さ
+        
+        particles.push({
+            x: x,
+            y: y,
+            dx: Math.cos(angle) * speed,
+            dy: sY + Math.sin(angle) * speed,
+            color: color,
+            life: 0 
+        });
+    }
+}
+
+// 消滅ワイアーエフェクトの生成
+function createDeadWireEffect(wire) {
+    deadWires.push({
+        x: wire.x,
+        y: wire.y,
+        alpha: 1.0,
+        dy: 1.0 // 下方向への初速
+    });
+}
+
+// 新しいボールの出現ロジック（コスト消費型）
+function trySpawnNewBall() {
+    // 画面内のボールの数がコストプール以下の場合に判定を行う
+    if (balls.length > ballSpawnCostPool) return;
+
+    // ランダムにサイズ（1〜7）を決定
+    let targetSizeIndex = Math.floor(Math.random() * 7) + 1;
+    
+    // 消費コストの計算 (サイズに応じた最小サイズボールの個数分 = 2^(sizeIndex - 1))
+    let requiredCost = Math.pow(2, targetSizeIndex - 1);
+
+    // 蓄積コストが足りているかチェック
+    if (ballSpawnCostPool >= requiredCost) {
+        ballSpawnCostPool -= requiredCost;
+
+        // 自機から離れた位置に生成するための計算
+        let spawnX;
+        const maxRadius = BALL_SIZES[7].radius;
+        const safeDistance = 200; 
+        const playerCenterX = player.x + player.width / 2;
+
+        let canSpawnLeft = (playerCenterX - safeDistance) > maxRadius;
+        let canSpawnRight = (playerCenterX + safeDistance) < (canvas.width - maxRadius);
+
+        if (canSpawnLeft && canSpawnRight) {
+            if (Math.random() < 0.5) {
+                spawnX = maxRadius + Math.random() * (playerCenterX - safeDistance - maxRadius);
+            } else {
+                spawnX = (playerCenterX + safeDistance) + Math.random() * (canvas.width - maxRadius - (playerCenterX + safeDistance));
+            }
+        } else if (canSpawnLeft) {
+            spawnX = maxRadius + Math.random() * (playerCenterX - safeDistance - maxRadius);
+        } else {
+            spawnX = (playerCenterX + safeDistance) + Math.random() * (canvas.width - maxRadius - (playerCenterX + safeDistance));
+        }
+
+        let directionX = spawnX < canvas.width / 2 ? -1 : 1;
+        
+        // 天井（画面外）から自然落下で出現
+        spawnBall(spawnX, -maxRadius, targetSizeIndex, directionX, 0);
+    }
+}
+
+// ゲームの初期化
+function initGame() {
+    // リスタート確定時に選択中の難易度を現在のゲーム難易度に適用
+    currentDifficultyIndex = selectedDifficultyIndex;
+
+    balls = [];
+    wires = [];
+    particles = [];
+    deadWires = [];
+    maxWiresAllowable = 2;
+    destroyedSmallBallCount = 0;
+    ballSpawnCostPool = 16;
+    autoFireCooldown = 0;
+    score = 0;
+    displayScore = 0;
+    isCountingUp = false;
+    rollingDigits = [0]; // スコア表示を1桁の「0」にリセット
+    displayProgressRatio = 0.0; // ゲージの初期化
+    gameTimeElapsed = 0; // 経過時間をリセット
+    player.x = canvas.width / 2;
+    player.dx = 0;
+    player.life = MAX_LIFE; // ライフ初期化
+    player.invincibleTimer = 0; // 無敵初期化
+    
+    // 選択されている難易度のコストプール増加量を適用
+    ballSpawnCostIncrement = DIFFICULTY_SETTINGS[currentDifficultyIndex].increment;
+    
+    keys = {};
+    
+	createExplosion(player.x, GAME_HEIGHT, MAX_PARTICLES / 2, "#00ff00", -12);
+	
+    gameState = "PLAYING";
+}
+
+// キーボードイベント
+window.addEventListener("keydown", (e) => {
+    if ([" ", "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", "Escape"].includes(e.key)) {
+        e.preventDefault(); 
+    }
+
+    if (gameState === "TITLE") {
+        if (e.key === "ArrowUp") {
+            selectedDifficultyIndex = (selectedDifficultyIndex + DIFFICULTY_SETTINGS.length - 1) % DIFFICULTY_SETTINGS.length;
+        } else if (e.key === "ArrowDown") {
+            selectedDifficultyIndex = (selectedDifficultyIndex + 1) % DIFFICULTY_SETTINGS.length;
+        } else if (e.key === "ArrowLeft" || e.key === "ArrowRight") {
+            initGame();
+        }
+    } else if (gameState === "GAMEOVER") {
+        if (!isCountingUp) {
+            if (e.key === "ArrowUp") {
+                selectedDifficultyIndex = (selectedDifficultyIndex + DIFFICULTY_SETTINGS.length - 1) % DIFFICULTY_SETTINGS.length;
+            } else if (e.key === "ArrowDown") {
+                selectedDifficultyIndex = (selectedDifficultyIndex + 1) % DIFFICULTY_SETTINGS.length;
+            } else if (e.key === "ArrowLeft" || e.key === "ArrowRight") {
+                initGame();
+            }
+        }
+    } else if (gameState === "PLAYING") {
+        if (e.key === "Escape") {
+            gameState = "PAUSED";
+        } else {
+            keys[e.key] = true;
+        }
+    } else if (gameState === "PAUSED") {
+        if (e.key === "Escape") {
+            gameState = "PLAYING";
+        }
+    }
+});
+
+window.addEventListener("keyup", (e) => {
+    keys[e.key] = false;
+});
+
+// 衝突判定（円と線分）
+function checkWireCollision(ball, wireX, wireY) {
+    if (ball.x + ball.radius > wireX - 2 && ball.x - ball.radius < wireX + 2) {
+        if (ball.y + ball.radius > wireY && ball.y - ball.radius < GAME_HEIGHT) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// 衝突判定（長方形と円）
+function checkPlayerCollision(ball, rect) {
+    let closestX = Math.max(rect.x, Math.min(ball.x, rect.x + rect.width));
+    let closestY = Math.max(rect.y, Math.min(ball.y, rect.y + rect.height));
+
+    let distanceX = ball.x - closestX;
+    let distanceY = ball.y - closestY;
+    let distanceSquared = (distanceX * distanceX) + (distanceY * distanceY);
+
+    return distanceSquared < (ball.radius * ball.radius);
+}
+
+// 経過時間をフォーマットする関数 (MM:SS.hh)
+function formatGameTime(ms) {
+    let totalSeconds = Math.floor(ms / 1000);
+    let minutes = Math.floor(totalSeconds / 60);
+    let seconds = totalSeconds % 60;
+    let hundredths = Math.floor((ms % 1000) / 10);
+    
+    let mStr = String(minutes).padStart(2, '0');
+    let sStr = String(seconds).padStart(2, '0');
+    let hStr = String(hundredths).padStart(2, '0');
+    
+    return `${mStr}:${sStr}.${hStr}`;
+}
+
+// 更新処理 (60fpsで固定実行される)
+function update() {
+    if (gameState === "GAMEOVER" && isCountingUp) {
+        let elapsed = Date.now() - gameOverStartTime;
+        if (elapsed < 1000) {
+            // 1秒(1000ms)かけてスコアを線形補間
+            displayScore = Math.floor((elapsed / 1000) * score);
+        } else {
+            displayScore = score;
+            isCountingUp = false; // カウントアップ終了。リスタート可能へ
+        }
+    }
+
+    // 各桁のローリングアニメーション更新処理
+    // 実際の現在のスコアを文字列にする（ゼロ埋めなし、桁数は自動伸縮）
+    let targetScoreStr = String(score);
+    
+    // 現在のアニメーション用配列の長さ（桁数）が、目標のスコアの桁数より少なければ、
+    // 左側（配列の先頭）に「0」を必要な分だけ追加して桁数を合わせる
+    while (rollingDigits.length < targetScoreStr.length) {
+        rollingDigits.unshift(0);
+    }
+
+    // 各桁を目標値に向かってローリングさせる
+    for (let d = 0; d < rollingDigits.length; d++) {
+        let targetDigit = parseInt(targetScoreStr[d]);
+        if (rollingDigits[d] !== targetDigit) {
+            rollingDigits[d] = (rollingDigits[d] + 9) % 10;
+        }
+    }
+
+    // ゲージの滑らかなアニメーション更新処理
+    let requiredToUpgrade = Math.pow(2, maxWiresAllowable);
+    let targetProgressRatio = maxWiresAllowable >= ABSOLUTE_MAX_WIRES ? 1.0 : destroyedSmallBallCount / requiredToUpgrade;
+    
+    // 現在値から目標値へ少しずつ補間（1フレームごとに差分の15%ずつ近づく）
+    displayProgressRatio += (targetProgressRatio - displayProgressRatio) * 0.15;
+    if (Math.abs(targetProgressRatio - displayProgressRatio) < 0.001) {
+        displayProgressRatio = targetProgressRatio;
+    }
+
+    // 消滅ワイアーエフェクトの更新処理 (PLAYING/GAMEOVER/PAUSED共通で動かすことで不自然なフリーズを防ぐ)
+    if (gameState !== "PAUSED") {
+        for (let i = deadWires.length - 1; i >= 0; i--) {
+            let dw = deadWires[i];
+            dw.dy += GRAVITY; // 重力で加速
+            dw.y += dw.dy;    // 位置更新
+            dw.alpha -= 0.08; // フェードアウト速度
+            
+            if (dw.alpha <= 0 || dw.y >= GAME_HEIGHT) {
+                deadWires.splice(i, 1);
+            }
+        }
+    }
+
+    if (gameState !== "PLAYING") return;
+
+    // 内部処理的な経過時間を蓄積 (1フレーム = TIMESTEP分のミリ秒)
+    gameTimeElapsed += TIMESTEP;
+
+    // 無敵タイマーの更新
+    if (player.invincibleTimer > 0) {
+        player.invincibleTimer--;
+    }
+
+    // エフェクト（パーティクル）の更新処理
+    for (let i = particles.length - 1; i >= 0; i--) {
+        let p = particles[i];
+        p.x += p.dx;
+        p.y += p.dy;
+		p.dy += GRAVITY;
+        p.life++; 
+    }
+
+    // プレイヤー移動
+    player.dx = 0;
+    if (keys["ArrowLeft"]) player.dx = -player.speed;
+    if (keys["ArrowRight"]) player.dx = player.speed;
+    
+    player.x += player.dx;
+    
+    if (player.x < 0) player.x = 0;
+    if (player.x > canvas.width - player.width) player.x = canvas.width - player.width;
+
+    // 自動射出ロジック
+    autoFireCooldown--;
+    if (wires.length < maxWiresAllowable && autoFireCooldown <= 0) {
+        wires.push({
+            x: player.x + (Math.random()*0.5+0.25) * player.width,
+            y: player.y,
+            speed: 5
+        });
+        autoFireCooldown = FIRE_COOLDOWN_LIMIT;
+    }
+
+    // ワイアーの移動
+    for (let i = wires.length - 1; i >= 0; i--) {
+        wires[i].y -= wires[i].speed;
+        if (wires[i].y <= 0) {
+            createDeadWireEffect(wires[i]); // 天井到達時もエフェクト生成
+            wires.splice(i, 1);
+        }
+    }
+
+    // ボールの物理と衝突判定
+    for (let i = balls.length - 1; i >= 0; i--) {
+        let b = balls[i];
+        
+        b.x += b.dx;
+        b.dy += GRAVITY;
+        b.y += b.dy;
+
+        // 左右の壁衝突
+        if (b.x - b.radius < 0) {
+            b.x = b.radius;
+            b.dx *= -1;
+        }
+        if (b.x + b.radius > canvas.width) {
+            b.x = canvas.width - b.radius;
+            b.dx *= -1;
+        }
+        
+        // 天井衝突判定
+/* if (b.y - b.radius < 0) {
+           b.y = b.radius;
+            b.dy *= -1;
+        }*/
+
+        // 地面衝突
+        if (b.y + b.radius > GAME_HEIGHT) {
+            b.y = GAME_HEIGHT - b.radius;
+            b.dy *= BOUNCE_COEFF;
+            
+            // 最低限の跳ね返り高さを保証（サイズインデックスが大きいほど高く跳ねる）
+            if (Math.abs(b.dy) < 3.5) {
+                b.dy = -4.0 - (b.sizeIndex * 0.4); 
+            }
+        }
+
+        // プレイヤーとの衝突判定
+        if (player.invincibleTimer === 0 && checkPlayerCollision(b, player)) {
+            player.life--;
+            createExplosion(player.x + player.width / 2, player.y + player.height / 2, 15, "#ff3333", -4);
+
+            if (player.life <= 0) {
+                gameState = "GAMEOVER";
+                isCountingUp = true;
+                gameOverStartTime = Date.now();
+                displayScore = 0;
+                keys = {};
+                return;
+            } else {
+                player.invincibleTimer = 180; // 3秒間（60fps × 3）無敵
+            }
+        }
+
+        // ワイアーとの衝突判定
+        for (let j = wires.length - 1; j >= 0; j--) {
+            if (checkWireCollision(b, wires[j].x, wires[j].y)) {
+                createDeadWireEffect(wires[j]); // ボール接触時に消滅エフェクト生成
+                wires.splice(j, 1);
+                
+                // 加算されるスコア量を計算（現在の画面内のボールの数）
+                let pointsEarnedBase = balls.length;
+                score += pointsEarnedBase * maxWiresAllowable;
+                
+                // 消滅したボールの色のエフェクトを、現在の画面内のボールの数の数だけ生成
+                let ballColor = BALL_SIZES[b.sizeIndex].color;
+                createExplosion(b.x, b.y, pointsEarnedBase, ballColor, b.dy < 0 ? b.dy : -b.dy);
+                
+                // ボールの分裂・消滅ロジック
+                if (b.sizeIndex === 1) {
+                    // 最小サイズのボールを消去したときの処理
+                    destroyedSmallBallCount++;
+                    ballSpawnCostPool += ballSpawnCostIncrement; // 出現コストプールを難易度に応じた量加算
+                    
+                    // ワイアー強化判定 (現在の最大射出数の二乗を条件にする)
+                    let requiredToUpgrade = Math.pow(2, maxWiresAllowable);
+                    if (destroyedSmallBallCount >= requiredToUpgrade && maxWiresAllowable < ABSOLUTE_MAX_WIRES) {
+                        maxWiresAllowable++;
+                        destroyedSmallBallCount = 0;
+                        
+                        // ワイヤー最大数が増えるたびにライフを1回復（上限値を超えないように制御）
+                        if (player.life < MAX_LIFE) {
+                            player.life++;
+                        }
+                    }
+                } else {
+                    spawnSplitBalls(b);
+                }
+                
+                balls.splice(i, 1); 
+                break;
+            }
+        }
+    }
+
+    // 追加ボール出現判定を毎フレームチェック
+    trySpawnNewBall();
+}
+
+// 描画処理 (リフレッシュレートに合わせて実行される)
+function draw() {
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+    if (gameState === "TITLE") {
+        ctx.fillStyle = "#ffffff";
+        ctx.font = "bold 40px sans-serif";
+        ctx.textAlign = "center";
+        ctx.fillText("SUPER PANG", canvas.width / 2, GAME_HEIGHT / 2 - 50);
+        
+        ctx.font = "20px sans-serif";
+        ctx.fillStyle = "#aaaaaa";
+        ctx.fillText("PRESS LEFT OR RIGHT KEY TO START", canvas.width / 2, GAME_HEIGHT / 2 + 50);
+        
+        ctx.font = "32px sans-serif";
+        ctx.fillStyle = "#777777";
+        ctx.fillText("← →", canvas.width / 2, GAME_HEIGHT - 30);
+
+        // 難易度変更案内（選択中の難易度を描画）
+        let diffConfig = DIFFICULTY_SETTINGS[selectedDifficultyIndex];
+        ctx.font = "bold 20px sans-serif";
+        ctx.fillStyle = "#ffffff";
+        ctx.fillText("DIFFICULTY (▲▼): ", canvas.width / 2 - 40, GAME_HEIGHT / 2);
+        ctx.fillStyle = diffConfig.color;
+        ctx.textAlign = "left";
+        ctx.fillText(diffConfig.name, canvas.width / 2 + 60, GAME_HEIGHT / 2);
+        ctx.textAlign = "center";
+
+    } else if (gameState === "PLAYING" || gameState === "GAMEOVER" || gameState === "PAUSED") {
+        // 消滅したワイアーのエフェクト描画 (薄くなって落ちる点線)
+        ctx.lineWidth = 3;
+        ctx.setLineDash([4, 4]);
+        for (let dw of deadWires) {
+            ctx.strokeStyle = `rgba(255, 255, 255, ${dw.alpha})`;
+            ctx.beginPath();
+            ctx.moveTo(dw.x,dw.y);
+            ctx.lineTo(dw.x, GAME_HEIGHT );
+            ctx.stroke();
+        }
+
+        // 稼働中のワイアー (点線)
+        ctx.strokeStyle = "#ff0000";
+        ctx.lineWidth = 3;
+        ctx.setLineDash([4, 4]); // 4px描画して4px開ける点線
+        for (let w of wires) {
+            ctx.beginPath();
+            ctx.moveTo(w.x, w.y);
+            ctx.lineTo(w.x, GAME_HEIGHT);
+            ctx.stroke();
+        }
+        ctx.setLineDash([]); // 点線設定をリセット(他への影響を防ぐ)
+
+        // プレイヤー (無敵時間中は10フレーム周期で点滅させる)
+        let drawPlayer = true;
+        if (gameState === "PLAYING" && player.invincibleTimer > 0) {
+            if (Math.floor(player.invincibleTimer / 5) % 2 === 0) {
+                drawPlayer = false;
+            }
+        }
+        if (drawPlayer) {
+            ctx.fillStyle = "#00ff00";
+            ctx.fillRect(player.x, player.y, player.width, player.height);
+        }
+
+        // ボール
+        for (let b of balls) {
+            ctx.beginPath();
+            ctx.arc(b.x, b.y, b.radius, 0, Math.PI * 2);
+            ctx.fillStyle = BALL_SIZES[b.sizeIndex].color;
+            ctx.fill();
+            ctx.closePath();
+        }
+
+        // エフェクト（パーティクルドット）の描画
+        for (let p of particles) {
+            ctx.fillStyle = p.color;
+            ctx.globalAlpha = 1 - (p.life/15)%1;
+            ctx.fillRect(p.x, p.y, 3, 3); // 3x3ピクセルのドット
+        }
+        ctx.globalAlpha = 1.0; // 描画設定を元に戻す
+
+        // 左上：現在のゲーム難易度表示（リスタートまでは終了したゲームの難易度が維持される）
+        let diffConfig = DIFFICULTY_SETTINGS[currentDifficultyIndex];
+        ctx.font = "bold 16px sans-serif";
+        ctx.textAlign = "left";
+        ctx.fillStyle = diffConfig.color;
+        ctx.fillText(diffConfig.name, 15, 25);
+
+        // 右上：内部処理的経過時間の表示
+        ctx.font = "bold 16px monospace";
+        ctx.textAlign = "right";
+        ctx.fillStyle = "#ffffff";
+        ctx.fillText(formatGameTime(gameTimeElapsed), canvas.width - 15, 25);
+
+        // ------------------ 下部スペース of UI描画 ------------------
+        // UIエリアの背景を区切る境界線
+        ctx.strokeStyle = "#ffffff";
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.moveTo(0, UI_HEIGHT);
+        ctx.lineTo(canvas.width, UI_HEIGHT);
+        ctx.stroke();
+        
+        // 背景ゲージの描画
+        ctx.fillStyle = "#333333";
+        ctx.fillRect(0, UI_HEIGHT + 2, canvas.width, canvas.height - UI_HEIGHT - 2);
+        
+        // 進捗ゲージの描画 (アニメーション対応比率を使用)
+        ctx.fillStyle = maxWiresAllowable >= ABSOLUTE_MAX_WIRES ? "#00ffaa" : "#0055ff";
+        ctx.fillRect(0, UI_HEIGHT + 2, canvas.width * displayProgressRatio, canvas.height - UI_HEIGHT - 2);
+
+        // 左側：アンカー数表示（10未満はスラッシュ羅列、10以上は/×数）
+        ctx.fillStyle = "#ffffff";
+        ctx.font = "bold 16px sans-serif";
+        ctx.textAlign = "left";
+        
+        let anchorStr = "";
+        if (maxWiresAllowable < 10) {
+            anchorStr = "/".repeat(maxWiresAllowable);
+        } else {
+            anchorStr = `/×${maxWiresAllowable}`;
+        }
+        ctx.fillText(anchorStr, 20, UI_HEIGHT + 18);
+
+        // 中央：ライフ表示（★で残数を表現、上限3）
+        ctx.textAlign = "center";
+        ctx.font = "bold 14px sans-serif";
+        let lifeStr = "★".repeat(player.life) + "☆".repeat(MAX_LIFE - player.life);
+        ctx.fillText(lifeStr, canvas.width / 2, UI_HEIGHT + 18);
+
+        // 右側：可変長ローリングスコア表示
+        ctx.font = "bold 18px monospace"; 
+        ctx.textAlign = "right";
+        let rollingScoreStr = rollingDigits.join("");
+        ctx.fillText(`${rollingScoreStr}`, canvas.width - 20, UI_HEIGHT + 19);
+        // --------------------------------------------------------
+
+        // 一時停止画面
+        if (gameState === "PAUSED") {
+            ctx.fillStyle = "rgba(0, 0, 0, 0.5)";
+            ctx.fillRect(0, 0, canvas.width, GAME_HEIGHT);
+
+            ctx.fillStyle = "#ffffff";
+            ctx.font = "bold 45px sans-serif";
+            ctx.textAlign = "center";
+            ctx.fillText("PAUSE", canvas.width / 2, GAME_HEIGHT / 2 - 10);
+
+            ctx.font = "20px sans-serif";
+            ctx.fillStyle = "#aaaaaa";
+            ctx.fillText("PRESS ESC TO RESUME", canvas.width / 2, GAME_HEIGHT / 2 + 30);
+        }
+
+        // ゲームオーバー画面
+        if (gameState === "GAMEOVER") {
+            ctx.fillStyle = "rgba(0, 0, 0, 0.75)";
+            ctx.fillRect(0, 0, canvas.width, GAME_HEIGHT);
+
+            ctx.fillStyle = "#ff3333";
+            ctx.font = "bold 45px sans-serif";
+            ctx.textAlign = "center";
+            ctx.fillText("GAME OVER", canvas.width / 2, GAME_HEIGHT / 2 - 60);
+
+            // 中央にスコアを表示
+            ctx.fillStyle = "#ffffff";
+            ctx.font = "bold 40px sans-serif";
+            ctx.fillText(`SCORE: ${displayScore}`, canvas.width / 2, GAME_HEIGHT / 2 - 5);
+
+            // カウントアップ中か否かで案内文を切り替え
+            ctx.font = "20px sans-serif";
+            if (isCountingUp) {
+                ctx.fillStyle = "#888888";
+                ctx.fillText("WAITING...", canvas.width / 2, GAME_HEIGHT / 2 + 75);
+            } else {
+                // ゲームオーバー時の難易度設定案内（選択中の難易度を描画）
+                let selectDiffConfig = DIFFICULTY_SETTINGS[selectedDifficultyIndex];
+                ctx.font = "bold 18px sans-serif";
+                ctx.fillStyle = "#ffffff";
+                ctx.fillText("DIFFICULTY (▲▼): ", canvas.width / 2 - 40, GAME_HEIGHT / 2 + 45);
+                ctx.fillStyle = selectDiffConfig.color;
+                ctx.textAlign = "left";
+                ctx.fillText(selectDiffConfig.name, canvas.width / 2 + 60, GAME_HEIGHT / 2 + 45);
+                ctx.textAlign = "center";
+
+                ctx.font = "20px sans-serif";
+                ctx.fillStyle = "#ffff00";
+                ctx.fillText("PRESS LEFT OR RIGHT KEY TO RESTART", canvas.width / 2, GAME_HEIGHT / 2 + 80);
+            }
+        }
+    }
+}
+
+// メインループ
+function gameLoop(timestamp) {
+    // 初回ループ時の初期化
+    if (!lastTime) lastTime = timestamp;
+
+    // 前回のフレームからの経過時間（ミリ秒）
+    let elapsed = timestamp - lastTime;
+    lastTime = timestamp;
+
+    // 異常に長い遅延（タブの切り替えなど）があった場合のスパイク対策（最大250msに制限）
+    if (elapsed > 250) elapsed = 250;
+
+    accumulator += elapsed;
+
+    // 蓄積された時間が1フレーム分（16.67ms）以上あれば、その分だけ内部処理を進める
+    while (accumulator >= TIMESTEP) {
+        update();
+        accumulator -= TIMESTEP;
+    }
+
+    // 描画処理（現在のディスプレイの最適なタイミングで描画）
+    draw();
+
+    requestAnimationFrame(gameLoop);
+}
+
+// ループ起動
+requestAnimationFrame(gameLoop);
+</script>
+
+</body>
+</html>
